@@ -1,0 +1,244 @@
+"""
+ADRS core scheduling module (no LLM — pure mechanics the agents wrap).
+
+Model
+-----
+Job = Sr. No. Each job has component operations (in-house on M1..M6, or outsourced
+off-site using no machine) plus one final ASSEMBLY operation on a single shared
+station "ASM". Assembly cannot start until ALL of the job's components are ready,
+including the returned outsourced part. A job completes when its assembly finishes.
+
+This precedence is what lets a late outsource return reach a shared resource (ASM),
+which is what gives rescheduling something to optimise.
+
+Calendar: weekdays only, 09:00-17:00 (8h/day). Time unit = working minute from the
+common release (2024-08-21 09:00). Objective: minimise total tardiness, then makespan.
+
+Public API
+----------
+load_ops(path)                                  -> list of operation dicts
+build_schedule(ops, now, frozen, actual_leads)  -> optimal plan for remaining problem
+evaluate_donothing(ops, committed, actual)      -> tardiness if plan is kept (right-shift)
+reschedule_from(ops, committed, now, actual)    -> frozen-horizon complete re-solve
+Helpers: outsourced_ops, assembly_index, fmt_wd, asm_order
+"""
+import math
+import random
+from datetime import datetime, timedelta
+from ortools.sat.python import cp_model
+
+SEED = 42
+LEAD_MIN_DAYS, LEAD_MAX_DAYS = 3, 10
+MIN_PER_DAY = 480
+ORIGIN = datetime(2024, 8, 21, 9, 0)
+PATH = "adrs\job_shop_clean_1.xlsx"
+ASM_STATION = "ASM"
+
+
+# ---------- calendar ----------
+def to_work_minutes(dt):
+    if dt <= ORIGIN:
+        return 0
+    total, cur = 0, ORIGIN
+    while cur.date() < dt.date():
+        if cur.weekday() < 5:
+            total += MIN_PER_DAY
+        cur = (cur + timedelta(days=1)).replace(hour=9, minute=0)
+    if dt.weekday() < 5:
+        total += max(0, min(dt.hour, 17) * 60 - 540)
+    return total
+
+
+def fmt_wd(mins):
+    return f"{mins / MIN_PER_DAY:.1f}wd"
+
+
+# ---------- data ----------
+def load_ops(path=PATH, seed=SEED):
+    """Return operations. Outsource lead times are drawn from a fixed seed so the
+    assumed (planned) durations are reproducible."""
+    import pandas as pd
+    random.seed(seed)
+    df = pd.read_excel(path)
+    ops = []
+    for r in df.itertuples(index=False):
+        op_type = getattr(r, "Operation")
+        proc = getattr(r, "_8")              # 'Process Type'
+        machine = getattr(r, "_9")           # 'Machine Number'
+        qty = getattr(r, "_5")               # 'Quantity Required'
+        cyc = getattr(r, "_10")              # 'Cycle Time (seconds)'
+        job = int(getattr(r, "_1"))          # 'Sr. No'
+        due = to_work_minutes(pd.Timestamp(getattr(r, "_4")).to_pydatetime())  # 'Promised Delivery Date'
+
+        if str(op_type) == "Assembly":
+            kind, outsourced = "asm", False
+            dur = math.ceil(qty * cyc / 60.0)
+            machine = ASM_STATION
+        elif proc == "Outsource":
+            kind, outsourced = "comp", True
+            dur = random.randint(LEAD_MIN_DAYS, LEAD_MAX_DAYS) * MIN_PER_DAY
+            machine = None
+        else:
+            kind, outsourced = "comp", False
+            dur = math.ceil(qty * cyc / 60.0)
+
+        ops.append(dict(idx=len(ops), job=job, comp=getattr(r, "Components"),
+                        kind=kind, machine=machine, outsourced=outsourced,
+                        dur=dur, due=due))
+    return ops
+
+
+def outsourced_ops(ops):
+    return [o for o in ops if o["outsourced"]]
+
+
+def assembly_index(ops, job):
+    return next(o["idx"] for o in ops if o["job"] == job and o["kind"] == "asm")
+
+
+def _dur(o, actual_leads):
+    if o["outsourced"] and o["idx"] in actual_leads:
+        return actual_leads[o["idx"]]
+    return o["dur"]
+
+
+# ---------- scheduler ----------
+def build_schedule(ops, now=0, frozen=None, actual_leads=None, time_limit=20):
+    """Solve the (possibly partial) problem from `now`.
+    frozen: {idx: start} operations pinned to a fixed start (already begun / known).
+    actual_leads: {idx: minutes} real outsource durations that override the assumption.
+    """
+    frozen = frozen or {}
+    actual_leads = actual_leads or {}
+    horizon = sum(_dur(o, actual_leads) for o in ops) + max(o["due"] for o in ops) + MIN_PER_DAY * 40
+
+    m = cp_model.CpModel()
+    s, e = {}, {}
+    machines = sorted({o["machine"] for o in ops if o["machine"]})
+    mach_iv = {mc: [] for mc in machines}
+
+    for o in ops:
+        i = o["idx"]
+        d = _dur(o, actual_leads)
+        lo = 0 if i in frozen else now
+        si = m.new_int_var(lo, horizon, f"s{i}")
+        ei = m.new_int_var(lo, horizon, f"e{i}")
+        iv = m.new_interval_var(si, d, ei, f"iv{i}")
+        s[i], e[i] = si, ei
+        if i in frozen:
+            m.add(si == frozen[i])
+        if o["machine"]:
+            mach_iv[o["machine"]].append(iv)
+
+    for mc in machines:
+        m.add_no_overlap(mach_iv[mc])
+
+    # assembly precedence: assembly starts only after all the job's components finish
+    for a in ops:
+        if a["kind"] == "asm":
+            for c in ops:
+                if c["job"] == a["job"] and c["kind"] == "comp":
+                    m.add(s[a["idx"]] >= e[c["idx"]])
+
+    jobs = sorted({o["job"] for o in ops})
+    tard, comp = {}, {}
+    for j in jobs:
+        ai = assembly_index(ops, j)
+        due = next(o["due"] for o in ops if o["job"] == j)
+        cj = e[ai]                       # job completes when assembly finishes
+        tj = m.new_int_var(0, horizon, f"T{j}")
+        m.add_max_equality(tj, [cj - due, 0])
+        comp[j], tard[j] = cj, tj
+
+    mk = m.new_int_var(0, horizon, "mk")
+    m.add_max_equality(mk, [e[o["idx"]] for o in ops])
+    m.minimize(sum(tard.values()) * 100000 + mk)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit
+    solver.parameters.num_search_workers = 1
+    solver.parameters.random_seed = SEED
+    status = solver.solve(m)
+
+    plan = {o["idx"]: dict(start=solver.value(s[o["idx"]]),
+                           end=solver.value(e[o["idx"]]),
+                           machine=o["machine"]) for o in ops}
+    return dict(status=solver.status_name(status), plan=plan,
+                tardiness={j: solver.value(tard[j]) for j in jobs},
+                completion={j: solver.value(comp[j]) for j in jobs},
+                total_tardiness=sum(solver.value(tard[j]) for j in jobs),
+                makespan=solver.value(mk))
+
+
+# ---------- do-nothing (predictive-reactive right-shift) ----------
+def evaluate_donothing(ops, committed, actual_leads):
+    """Keep the committed plan's resource ORDER; right-shift in time to absorb the
+    real outsource returns. Components are unaffected (no upstream); only the ASM
+    queue right-shifts behind any job whose part is now late. This is the rigid
+    'no rescheduling' baseline (predictive-reactive right-shift)."""
+    comp_end = {}
+    for o in ops:
+        if o["kind"] == "comp":
+            comp_end[o["idx"]] = committed[o["idx"]]["start"] + _dur(o, actual_leads)
+
+    asm_ops = sorted([o for o in ops if o["kind"] == "asm"],
+                     key=lambda o: committed[o["idx"]]["start"])
+    clock, tard, comp = 0, {}, {}
+    for o in asm_ops:
+        ready = max(comp_end[c["idx"]] for c in ops
+                    if c["job"] == o["job"] and c["kind"] == "comp")
+        start = max(clock, ready)
+        end = start + o["dur"]
+        clock = end
+        due = next(x["due"] for x in ops if x["job"] == o["job"])
+        comp[o["job"]] = end
+        tard[o["job"]] = max(0, end - due)
+    return dict(tardiness=tard, completion=comp, total_tardiness=sum(tard.values()))
+
+
+# ---------- reschedule (complete re-optimisation from now) ----------
+def reschedule_from(ops, committed, now, actual_returns):
+    """Frozen-horizon complete reschedule. Pin everything that has begun before
+    `now`, enforce the known actual outsource return(s), and re-optimise the rest."""
+    frozen = {}
+    for o in ops:
+        i = o["idx"]
+        st = committed[i]["start"]
+        if i in actual_returns:           # disrupted outsource: enforce real return
+            frozen[i] = st
+        elif st < now:                    # already started/finished in reality
+            frozen[i] = st
+    return build_schedule(ops, now=now, frozen=frozen, actual_leads=actual_returns)
+
+
+def asm_order(ops, plan):
+    """The sequence of jobs on the ASM station under a given plan (for explanations)."""
+    asm = sorted([o for o in ops if o["kind"] == "asm"], key=lambda o: plan[o["idx"]]["start"])
+    return [o["job"] for o in asm]
+
+
+# ---------- demo ----------
+if __name__ == "__main__":
+    ops = load_ops()
+    nominal = build_schedule(ops, now=0)
+    print(f"NOMINAL  status={nominal['status']}  "
+          f"total tardiness={fmt_wd(nominal['total_tardiness'])}  makespan={fmt_wd(nominal['makespan'])}")
+    print(f"ASM order (nominal): {asm_order(ops, nominal['plan'])}\n")
+
+    dis = next(o['idx'] for o in ops if o['job'] == 8 and o['outsourced'])
+    assumed = ops[dis]['dur']
+    actual = {dis: 22 * MIN_PER_DAY}
+    now = assumed
+    print(f"DISRUPTION  Job 8 outsourced {ops[dis]['comp']}: assumed {fmt_wd(assumed)} -> "
+          f"actual {fmt_wd(actual[dis])}, learned at now={fmt_wd(now)}\n")
+
+    dn = evaluate_donothing(ops, nominal['plan'], actual)
+    rs = reschedule_from(ops, nominal['plan'], now, actual)
+    print(f"DO-NOTHING  total tardiness={fmt_wd(dn['total_tardiness'])}")
+    print(f"RESCHEDULE  total tardiness={fmt_wd(rs['total_tardiness'])}  status={rs['status']}")
+    print(f"GAP closed by rescheduling = {fmt_wd(dn['total_tardiness'] - rs['total_tardiness'])}\n")
+    print(f"ASM order (reschedule): {asm_order(ops, rs['plan'])}  <- Job 8 pushed back; ready jobs first")
+    print("\nPer-job tardiness (working-days):")
+    print(f"  {'job':>3}{'do-nothing':>12}{'reschedule':>12}")
+    for j in sorted(dn['tardiness']):
+        print(f"  {j:>3}{dn['tardiness'][j] / MIN_PER_DAY:>12.1f}{rs['tardiness'][j] / MIN_PER_DAY:>12.1f}")
