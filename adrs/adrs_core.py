@@ -31,7 +31,7 @@ SEED = 42
 LEAD_MIN_DAYS, LEAD_MAX_DAYS = 3, 10
 MIN_PER_DAY = 480
 ORIGIN = datetime(2024, 8, 21, 9, 0)
-PATH = "adrs\job_shop_clean_1.xlsx"
+PATH = "job_shop_clean_1.xlsx"
 ASM_STATION = "ASM"
 
 
@@ -108,8 +108,9 @@ def build_schedule(ops, now=0, frozen=None, actual_leads=None, time_limit=20):
     frozen: {idx: start} operations pinned to a fixed start (already begun / known).
     actual_leads: {idx: minutes} real outsource durations that override the assumption.
     """
-    frozen = frozen or {}
-    actual_leads = actual_leads or {}
+    now = int(now)
+    frozen = {int(k): int(v) for k, v in (frozen or {}).items()}
+    actual_leads = {int(k): int(v) for k, v in (actual_leads or {}).items()}
     horizon = sum(_dur(o, actual_leads) for o in ops) + max(o["due"] for o in ops) + MIN_PER_DAY * 40
 
     m = cp_model.CpModel()
@@ -127,6 +128,8 @@ def build_schedule(ops, now=0, frozen=None, actual_leads=None, time_limit=20):
         s[i], e[i] = si, ei
         if i in frozen:
             m.add(si == frozen[i])
+            if o["outsourced"]:
+                m.add(si == 0)        # dispatched at release; return time = lead time
         if o["machine"]:
             mach_iv[o["machine"]].append(iv)
 
