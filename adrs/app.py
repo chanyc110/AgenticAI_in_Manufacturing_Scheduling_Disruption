@@ -99,10 +99,8 @@ with st.expander("Pause and input actual outsource returns, then reschedule", ex
         inputs[o["idx"]] = int(round(val * MPD)) - committed[o["idx"]]["start"]  # -> actual lead
     if c3.button("⟳ Reschedule") or st.button("Apply actual returns and reschedule"):
         st.session_state.actual_returns = {i: d for i, d in inputs.items()}
-        if "agent_app" not in st.session_state:
-            st.session_state.agent_app = adrs_agents.build_app()
         with st.spinner("ADRS agents reasoning…"):
-            final = st.session_state.agent_app.invoke({
+            final = adrs_agents.build_app().invoke({       # build fresh, not cached
                 "ops": ops,
                 "committed_plan": committed,
                 "now": int(clock),

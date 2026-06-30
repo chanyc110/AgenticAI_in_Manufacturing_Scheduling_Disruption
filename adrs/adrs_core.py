@@ -174,11 +174,15 @@ def build_schedule(ops, now=0, frozen=None, actual_leads=None, time_limit=20):
 
 
 # ---------- do-nothing (predictive-reactive right-shift) ----------
-def evaluate_donothing(ops, committed, actual_leads):
-    """Keep the committed plan's resource ORDER; right-shift in time to absorb the
-    real outsource returns. Components are unaffected (no upstream); only the ASM
-    queue right-shifts behind any job whose part is now late. This is the rigid
-    'no rescheduling' baseline (predictive-reactive right-shift)."""
+def evaluate_donothing(ops, committed, actual_leads, now=0):
+    """Keep the committed plan's ASM order; right-shift in time to absorb the real
+    outsource returns. Assembly ops already started before `now` are FROZEN at their
+    committed times (they happened); only ops not yet started are right-shifted, and
+    no earlier than `now`. This mirrors reschedule_from's frozen horizon so the two
+    policies are compared on the same footing."""
+    now = int(now)
+    actual_leads = {int(k): int(v) for k, v in (actual_leads or {}).items()}
+
     comp_end = {}
     for o in ops:
         if o["kind"] == "comp":
@@ -188,11 +192,15 @@ def evaluate_donothing(ops, committed, actual_leads):
                      key=lambda o: committed[o["idx"]]["start"])
     clock, tard, comp = 0, {}, {}
     for o in asm_ops:
+        cstart = committed[o["idx"]]["start"]
         ready = max(comp_end[c["idx"]] for c in ops
                     if c["job"] == o["job"] and c["kind"] == "comp")
-        start = max(clock, ready)
+        if cstart < now:                      # frozen: already started before now
+            start = cstart
+        else:                                 # not yet started: right-shift around now
+            start = max(clock, ready, now)
         end = start + o["dur"]
-        clock = end
+        clock = max(clock, end)
         due = next(x["due"] for x in ops if x["job"] == o["job"])
         comp[o["job"]] = end
         tard[o["job"]] = max(0, end - due)
