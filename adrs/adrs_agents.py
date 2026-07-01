@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import MemorySaver
 
 import adrs_core as core
 
@@ -35,6 +37,17 @@ class ImpactOut(BaseModel):
 det_llm = llm.with_structured_output(DetectionOut)
 imp_llm = llm.with_structured_output(ImpactOut)
 
+class OptionLine(BaseModel):
+    objective: str = Field(description="the option's objective key")
+    explanation: str = Field(description="one plain sentence: what it prioritises and its trade-off vs the others")
+
+class OptionsAdvice(BaseModel):
+    lines: list[OptionLine]
+    recommended: Literal["tardiness", "makespan", "stability", "balanced"]
+    reason: str = Field(description="one sentence: why the recommended option is the sensible default")
+
+adv_llm = llm.with_structured_output(OptionsAdvice)
+
 
 # ---------- shared state ----------
 class State(TypedDict, total=False):
@@ -50,6 +63,9 @@ class State(TypedDict, total=False):
     impact_reasoning: str
     reschedule: dict               # rescheduling output
     explanation: str               # explainability output
+    chosen: dict                   # the option the user picked (set on resume)
+    options: list                  # the 4 option plans (from objectives layer)
+    advice: dict                   # options advisor output
 
 
 # ---------- 1. Orchestrator ----------
@@ -106,16 +122,60 @@ def impact(state: State) -> dict:
     decision = "reschedule" if collateral else "no_action"   # deterministic gate
     return {"donothing": dn, "collateral": collateral, "dis_jobs": sorted(dis_jobs),
             "decision": decision, "impact_reasoning": out.reasoning}
+    
+    
+# ---------- 4. Objectives layer (runs optimiser once per objective) ----------
+def objectives(state: State) -> dict:
+    opts = core.generate_options(state["ops"], state["committed_plan"],
+                                 state["now"], state["actual_returns"])
+    return {"options": opts}
 
 
-# ---------- 4. Rescheduling (the only OR-Tools call) ----------
+# ---------- 5. Options Advisor (compares options, recommends one) ----------
+def options_advisor(state: State) -> dict:
+    opts = state["options"]
+    summary = "\n".join(
+        f"{o['objective']} ({o['label']}): tardiness {core.fmt_wd(o['total_tardiness'])}, "
+        f"makespan {core.fmt_wd(o['makespan'])}, {o['ops_changed']} operations moved"
+        for o in opts)
+    facts = "; ".join(state["disruption"]["facts"])
+    prompt = (
+        "You are the Options Advisor agent for a production planner. Four rescheduling "
+        "options were produced, each optimising a different objective. For EACH option, "
+        "write one plain sentence on what it prioritises and its trade-off compared with "
+        "the others. Then recommend ONE option as the sensible default and justify in one "
+        "sentence. Prefer the option with lowest tardiness; break ties by fewest operations "
+        f"moved (less disruption).\n\nDisruption: {facts}\n\nOptions:\n{summary}")
+    out = adv_llm.invoke(prompt)
+    return {"advice": dict(recommended=out.recommended, reason=out.reason,
+                           explanations={l.objective: l.explanation for l in out.lines})}
+    
+    
+# ---------- 6. Human pick (suspends the graph until the user chooses) ----------
+def human_pick(state: State) -> dict:
+    # interrupt() halts the run here; the value is surfaced to the app.
+    # On resume, Command(resume=...) supplies the chosen objective key.
+    chosen_objective = interrupt({
+        "options": [{"objective": o["objective"], "label": o["label"],
+                     "total_tardiness": o["total_tardiness"], "makespan": o["makespan"],
+                     "ops_changed": o["ops_changed"]} for o in state["options"]],
+        "advice": state["advice"],
+    })
+    chosen = next(o for o in state["options"] if o["objective"] == chosen_objective)
+    return {"chosen": chosen,
+            "reschedule": {"plan": chosen["plan"],
+                           "tardiness": core.plan_tardiness(state["ops"], chosen["plan"]),
+                           "total_tardiness": chosen["total_tardiness"]}}
+
+
+# ---------- 7. Rescheduling (the only OR-Tools call) ----------
 def rescheduling(state: State) -> dict:
     rs = core.reschedule_from(state["ops"], state["committed_plan"],
                               state["now"], state["actual_returns"])
     return {"reschedule": rs}
 
 
-# ---------- 5. Explainability ----------
+# ---------- 8. Explainability ----------
 def explainability(state: State) -> dict:
     ops, committed = state["ops"], state["committed_plan"]
     dn = state["donothing"]
@@ -158,17 +218,21 @@ def build_app():
     g.add_node("orchestrator", orchestrator)
     g.add_node("detection", detection)
     g.add_node("impact", impact)
-    g.add_node("rescheduling", rescheduling)
-    g.add_node("explainability", explainability)
+    g.add_node("objectives", objectives)
+    g.add_node("options_advisor", options_advisor)
+    g.add_node("human_pick", human_pick)
+    g.add_node("explainability", explainability)   # used on the no_action branch
 
     g.add_edge(START, "orchestrator")
     g.add_edge("orchestrator", "detection")
     g.add_edge("detection", "impact")
     g.add_conditional_edges("impact", route,
-                            {"reschedule": "rescheduling", "no_action": "explainability"})
-    g.add_edge("rescheduling", "explainability")
+                            {"reschedule": "objectives", "no_action": "explainability"})
+    g.add_edge("objectives", "options_advisor")
+    g.add_edge("options_advisor", "human_pick")
+    g.add_edge("human_pick", "explainability")
     g.add_edge("explainability", END)
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())   # checkpointer enables suspend/resume
 
 
 # ---------- run ----------

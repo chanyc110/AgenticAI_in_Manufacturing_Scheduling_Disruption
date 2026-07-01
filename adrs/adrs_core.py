@@ -23,7 +23,6 @@ reschedule_from(ops, committed, now, actual)    -> frozen-horizon complete re-so
 Helpers: outsourced_ops, assembly_index, fmt_wd, asm_order
 """
 import math
-import random
 from datetime import datetime, timedelta
 from ortools.sat.python import cp_model
 
@@ -31,7 +30,7 @@ SEED = 42
 LEAD_MIN_DAYS, LEAD_MAX_DAYS = 3, 10
 MIN_PER_DAY = 480
 ORIGIN = datetime(2024, 8, 21, 9, 0)
-PATH = "job_shop_clean_1.xlsx"
+PATH = "job_shop_updated.xlsx"
 ASM_STATION = "ASM"
 
 
@@ -54,21 +53,23 @@ def fmt_wd(mins):
 
 
 # ---------- data ----------
-def load_ops(path=PATH, seed=SEED):
-    """Return operations. Outsource lead times are drawn from a fixed seed so the
-    assumed (planned) durations are reproducible."""
+def load_ops(path=PATH):
+    """Return operations. Component/assembly durations come from Cycle Time (seconds)
+    x Quantity. Outsource lead times come from a dedicated column (Assumed Lead Time
+    (days)) — fixed and reproducible, no randomness. Columns are read by name, so
+    reordering or adding spreadsheet columns won't silently break this."""
     import pandas as pd
-    random.seed(seed)
     df = pd.read_excel(path)
     ops = []
-    for r in df.itertuples(index=False):
-        op_type = getattr(r, "Operation")
-        proc = getattr(r, "_8")              # 'Process Type'
-        machine = getattr(r, "_9")           # 'Machine Number'
-        qty = getattr(r, "_5")               # 'Quantity Required'
-        cyc = getattr(r, "_10")              # 'Cycle Time (seconds)'
-        job = int(getattr(r, "_1"))          # 'Sr. No'
-        due = to_work_minutes(pd.Timestamp(getattr(r, "_4")).to_pydatetime())  # 'Promised Delivery Date'
+    for _, r in df.iterrows():
+        op_type = r["Operation"]
+        proc = r["Process Type"]
+        machine = r["Machine Number"]
+        qty = r["Quantity Required"]
+        cyc = r["Cycle Time (seconds)"]
+        lead_days = r["Assumed Lead Time (days)"]
+        job = int(r["Sr. No"])
+        due = to_work_minutes(pd.Timestamp(r["Promised Delivery Date"]).to_pydatetime())
 
         if str(op_type) == "Assembly":
             kind, outsourced = "asm", False
@@ -76,13 +77,13 @@ def load_ops(path=PATH, seed=SEED):
             machine = ASM_STATION
         elif proc == "Outsource":
             kind, outsourced = "comp", True
-            dur = random.randint(LEAD_MIN_DAYS, LEAD_MAX_DAYS) * MIN_PER_DAY
+            dur = int(round(lead_days)) * MIN_PER_DAY   # dedicated column, in working-days
             machine = None
         else:
             kind, outsourced = "comp", False
             dur = math.ceil(qty * cyc / 60.0)
 
-        ops.append(dict(idx=len(ops), job=job, comp=getattr(r, "Components"),
+        ops.append(dict(idx=len(ops), job=job, comp=r["Components"],
                         kind=kind, machine=machine, outsourced=outsourced,
                         dur=dur, due=due))
     return ops
@@ -103,7 +104,7 @@ def _dur(o, actual_leads):
 
 
 # ---------- scheduler ----------
-def build_schedule(ops, now=0, frozen=None, actual_leads=None, time_limit=20):
+def build_schedule(ops, now=0, frozen=None, actual_leads=None, objective="tardiness", reference_plan=None, time_limit=20):
     """Solve the (possibly partial) problem from `now`.
     frozen: {idx: start} operations pinned to a fixed start (already begun / known).
     actual_leads: {idx: minutes} real outsource durations that override the assumption.
@@ -155,7 +156,27 @@ def build_schedule(ops, now=0, frozen=None, actual_leads=None, time_limit=20):
 
     mk = m.new_int_var(0, horizon, "mk")
     m.add_max_equality(mk, [e[o["idx"]] for o in ops])
-    m.minimize(sum(tard.values()) * 100000 + mk)
+    total_tard = sum(tard.values())
+
+    if reference_plan is not None:                 # stability = total movement vs reference
+        devs = []
+        for o in ops:
+            i = o["idx"]
+            if i in reference_plan:
+                dv = m.new_int_var(0, horizon, f"dev{i}")
+                m.add_abs_equality(dv, s[i] - reference_plan[i]["start"])
+                devs.append(dv)
+        stability = sum(devs) if devs else 0
+    else:
+        stability = 0
+
+    OBJECTIVES = {
+        "tardiness": total_tard * 100000 + mk,
+        "makespan":  mk * 100000 + total_tard,
+        "stability": stability * 100000 + total_tard * 100 + mk,   # stability now dominates
+        "balanced":  total_tard * 50 + stability * 30 + mk,        # genuine blend, tuned
+    }
+    m.minimize(OBJECTIVES.get(objective, OBJECTIVES["tardiness"]))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
@@ -221,11 +242,107 @@ def reschedule_from(ops, committed, now, actual_returns):
             frozen[i] = st
     return build_schedule(ops, now=now, frozen=frozen, actual_leads=actual_returns)
 
+OBJECTIVE_LABELS = {
+    "tardiness": "Fewest late deliveries",
+    "makespan":  "Finish batch soonest",
+    "stability": "Least disruption to plan",
+    "balanced":  "Balanced trade-off",
+}
+
+def plan_tardiness(ops, plan):
+    """Per-job tardiness (working-minutes) for a given plan."""
+    tard = {}
+    for o in ops:
+        if o["kind"] == "asm":
+            due = next(x["due"] for x in ops if x["job"] == o["job"])
+            tard[o["job"]] = max(0, plan[o["idx"]]["end"] - due)
+    return tard
+
+def generate_options(ops, committed, now, actual_returns,
+                     objectives=("tardiness", "makespan", "stability", "balanced")):
+    """Objectives layer: run the optimiser once per objective -> a set of option plans."""
+    frozen = {}
+    for o in ops:
+        i = o["idx"]
+        st = committed[i]["start"]
+        if i in actual_returns or st < now:
+            frozen[i] = st
+    options = []
+    for obj in objectives:
+        res = build_schedule(ops, now=now, frozen=frozen, actual_leads=actual_returns,
+                             objective=obj, reference_plan=committed)
+        changed = sum(1 for o in ops
+                      if res["plan"][o["idx"]]["start"] != committed[o["idx"]]["start"])
+        options.append(dict(objective=obj, label=OBJECTIVE_LABELS[obj],
+                            plan=res["plan"], total_tardiness=res["total_tardiness"],
+                            makespan=res["makespan"], ops_changed=changed,
+                            asm_order=asm_order(ops, res["plan"])))
+    return options
 
 def asm_order(ops, plan):
     """The sequence of jobs on the ASM station under a given plan (for explanations)."""
     asm = sorted([o for o in ops if o["kind"] == "asm"], key=lambda o: plan[o["idx"]]["start"])
     return [o["job"] for o in asm]
+
+def compute_job_stats(ops, plan, actual_leads=None):
+    """Per-job stats against a plan: due date, predicted completion, tardiness,
+    and WHAT caused the lateness — either a specific component (the one whose
+    finish time gated assembly) or ASM station queue congestion (assembly was
+    ready but had to wait its turn on the shared station)."""
+    actual_leads = actual_leads or {}
+    stats = {}
+    for j in sorted({o["job"] for o in ops}):
+        comps = [o for o in ops if o["job"] == j and o["kind"] == "comp"]
+        asm = next(o for o in ops if o["job"] == j and o["kind"] == "asm")
+        due = asm["due"]
+        comp_finish = {c["idx"]: plan[c["idx"]]["start"] + _dur(c, actual_leads) for c in comps}
+        ready = max(comp_finish.values()) if comp_finish else 0
+        asm_start, asm_end = plan[asm["idx"]]["start"], plan[asm["idx"]]["end"]
+        tardiness = max(0, asm_end - due)
+
+        if asm_start > ready + 1:                      # ready but station was busy
+            cause, cause_kind = "ASM station queue delay", "congestion"
+        else:                                           # gated by a specific component
+            limiting = max(comps, key=lambda c: comp_finish[c["idx"]])
+            cause = f"{limiting['comp']} ({'outsourced' if limiting['outsourced'] else limiting['machine']})"
+            cause_kind = "outsourced" if limiting["outsourced"] else "in-house"
+
+        stats[j] = dict(job=j, due=due, completion=asm_end, tardiness=tardiness,
+                        on_time=(tardiness == 0), cause=cause, cause_kind=cause_kind,
+                        asm_start=asm_start, ready=ready)
+    return stats
+
+
+def compute_machine_utilisation(ops, plan):
+    """Busy time / overall makespan, per machine (incl. ASM)."""
+    machines = sorted({o["machine"] for o in ops if o["machine"]})
+    makespan = max(p["end"] for p in plan.values())
+    util = {}
+    for mc in machines:
+        busy = sum(plan[o["idx"]]["end"] - plan[o["idx"]]["start"]
+                   for o in ops if o["machine"] == mc)
+        util[mc] = dict(busy=busy, makespan=makespan,
+                        pct=(busy / makespan * 100) if makespan else 0)
+    return util
+
+
+def compute_waiting_times(ops, plan, actual_leads=None):
+    """Queueing delay per operation: time between when a part COULD have started
+    (release=0 for in-house components; all-components-ready for assembly) and
+    when it actually started. Outsourced legs are excluded — they're dispatched
+    immediately off-site, so there's no queueing concept for them."""
+    actual_leads = actual_leads or {}
+    rows = []
+    for o in ops:
+        if o["kind"] == "comp" and not o["outsourced"]:
+            wait = max(0, plan[o["idx"]]["start"] - 0)
+            rows.append(dict(job=o["job"], comp=o["comp"], kind="in-house", wait=wait))
+        elif o["kind"] == "asm":
+            comps = [c for c in ops if c["job"] == o["job"] and c["kind"] == "comp"]
+            ready = max((plan[c["idx"]]["start"] + _dur(c, actual_leads) for c in comps), default=0)
+            wait = max(0, plan[o["idx"]]["start"] - ready)
+            rows.append(dict(job=o["job"], comp="Assembly", kind="assembly", wait=wait))
+    return rows
 
 
 # ---------- demo ----------

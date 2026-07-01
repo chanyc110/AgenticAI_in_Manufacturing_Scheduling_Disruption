@@ -11,13 +11,21 @@ import streamlit as st
 import plotly.graph_objects as go
 import adrs_core as core
 import adrs_agents
+from langgraph.types import Command
 
 st.set_page_config(page_title="ADRS Simulation", layout="wide")
 MPD = core.MIN_PER_DAY
 COMP_COLORS = {"C1": "#7fb3ff", "C2": "#ff6b6b", "C3": "#e8554e", "C4": "#4ec9b0",
                "C5": "#3fb6a8", "C6": "#f5d76e", "OutSrc": "#3b6bd6", "Assembly": "#b388ff"}
-STATUS_COLORS = {"Completed_In House": "#5cb85c", "Completed_Outsource": "#2e7d32",
-                 "Late": "#e8554e", "InProgress_In House": "#9e9e9e", "Not started": "#444"}
+STATUS_COLORS = {
+    "Completed_In House": "#5cb85c",
+    "Completed_Outsource": "#2e7d32",
+    "InTransit_Outsource": "#3b6bd6",
+    "Late": "#e8554e",
+    "Late_Outsource": "#c0392b",       # distinct red for a late outsourced part
+    "InProgress_In House": "#9e9e9e",
+    "Not started": "#444",
+}
 
 
 def wm_to_dt(m):
@@ -33,6 +41,10 @@ def wm_to_dt(m):
         cur = (cur.replace(hour=17, minute=0) + timedelta(days=1)).replace(hour=9, minute=0)
     return cur
 
+if "graph" not in st.session_state:
+    st.session_state.graph = adrs_agents.build_app()
+    st.session_state.thread_id = 0
+    st.session_state.cfg = None
 
 # ---------- state ----------
 if "ops" not in st.session_state:
@@ -53,15 +65,138 @@ horizon = max(p["end"] for p in committed.values())
 def op_status(o, clock):
     p = committed[o["idx"]]
     actual = st.session_state.actual_returns
-    end = p["start"] + (actual.get(o["idx"], o["dur"]) if o["outsourced"] else o["dur"])
+    dur = actual.get(o["idx"], o["dur"]) if o["outsourced"] else o["dur"]
+    end = p["start"] + dur
     due = o["due"]
+    if o["outsourced"]:
+        if end <= clock:
+            return "Late_Outsource" if end > due else "Completed_Outsource"
+        if clock > due:
+            return "Late_Outsource"          # deadline passed, part still not back
+        return "InTransit_Outsource"
     if end <= clock:
-        if o["outsourced"]:
-            return "Completed_Outsource"
         return "Late" if end > due else "Completed_In House"
     if p["start"] <= clock < end:
         return "Late" if clock > due else "InProgress_In House"
     return "Not started"
+
+def render_options_panel():
+    opts = st.session_state.get("options")
+    advice = st.session_state.get("advice")
+    if not opts or not advice:
+        return
+    st.subheader("Rescheduling options")
+
+    def label(i):
+        o = opts[i]
+        star = " ⭐" if o["objective"] == advice["recommended"] else ""
+        return (f"{o['label']}{star} — tardiness {core.fmt_wd(o['total_tardiness'])}, "
+                f"makespan {core.fmt_wd(o['makespan'])}, {o['ops_changed']} ops moved")
+
+    default = next((i for i, o in enumerate(opts)
+                    if o["objective"] == advice["recommended"]), 0)
+    choice = st.radio("Choose a plan to apply:", range(len(opts)), index=default,
+                      format_func=label, key=f"optchoice_{st.session_state.opt_nonce}")
+
+    st.caption("**Recommended because:** " + advice["reason"])
+    for o in opts:
+        ex = advice["explanations"].get(o["objective"])
+        if ex:
+            st.caption(f"• **{o['label']}** — {ex}")
+
+    if st.button("✓ Apply selected plan"):
+        chosen = opts[choice]
+        cfg = st.session_state.cfg
+        if cfg is None:
+            st.warning("No active reschedule to apply — run Reschedule first.")
+            st.stop()
+        with st.spinner("Explaining applied plan…"):
+            final = st.session_state.graph.invoke(
+                Command(resume=chosen["objective"]), cfg)   # resume into explainability
+        st.session_state.committed = final["reschedule"]["plan"]   # rescheduling proceeds
+        st.session_state.applied_explanation = final["explanation"]
+        st.session_state.explanation = None
+        st.session_state.options = None
+        st.session_state.advice = None
+        st.rerun()
+        
+        
+def render_stats_panel():
+    st.subheader("📊 Schedule Statistics")
+
+    stats = core.compute_job_stats(ops, committed, st.session_state.actual_returns)
+    util = core.compute_machine_utilisation(ops, committed)
+    waits = core.compute_waiting_times(ops, committed, st.session_state.actual_returns)
+
+    jobs_sorted = sorted(stats)
+    on_time_jobs = [j for j in jobs_sorted if stats[j]["on_time"]]
+    late_jobs = [j for j in jobs_sorted if not stats[j]["on_time"]]
+    completed_now = [j for j in jobs_sorted if stats[j]["completion"] <= clock]
+    remaining_now = [j for j in jobs_sorted if stats[j]["completion"] > clock]
+
+    # 1. headline counts
+    c1_, c2_, c3_, c4_ = st.columns(4)
+    c1_.metric("On-time (predicted)", f"{len(on_time_jobs)}/{len(jobs_sorted)}")
+    c2_.metric("Late (predicted)", f"{len(late_jobs)}/{len(jobs_sorted)}")
+    c3_.metric("Completed so far", f"{len(completed_now)}/{len(jobs_sorted)}")
+    c4_.metric("Remaining", f"{len(remaining_now)}/{len(jobs_sorted)}")
+
+    # 2. machine utilisation
+    st.markdown("**Machine utilisation** (busy time ÷ schedule makespan)")
+    util_df = pd.DataFrame([
+        dict(Machine=mc, Utilisation=f"{v['pct']:.0f}%", **{"Busy time": core.fmt_wd(v['busy'])})
+        for mc, v in sorted(util.items())
+    ])
+    st.dataframe(util_df, hide_index=True, use_container_width=True)
+
+    # 3. average waiting time
+    st.markdown("**Average waiting time**")
+    inhouse_waits = [w["wait"] for w in waits if w["kind"] == "in-house"]
+    asm_waits = [w["wait"] for w in waits if w["kind"] == "assembly"]
+    wc1, wc2 = st.columns(2)
+    wc1.metric("Avg. in-house component queue wait",
+              core.fmt_wd(sum(inhouse_waits) / len(inhouse_waits)) if inhouse_waits else "0.0wd")
+    wc2.metric("Avg. assembly (ASM) queue wait",
+              core.fmt_wd(sum(asm_waits) / len(asm_waits)) if asm_waits else "0.0wd")
+    with st.expander("Waiting time detail per product/component"):
+        wait_df = pd.DataFrame([
+            dict(Product=f"Product {w['job']}", Component=w["comp"], Type=w["kind"],
+                 **{"Wait": core.fmt_wd(w["wait"])})
+            for w in sorted(waits, key=lambda w: (w["job"], w["kind"]))
+        ])
+        st.dataframe(wait_df, hide_index=True, use_container_width=True)
+
+    # 5. late products
+    st.markdown("**⚠️ Late products**")
+    if late_jobs:
+        late_df = pd.DataFrame([
+            dict(Product=f"Product {j}",
+                 **{"Late by": core.fmt_wd(stats[j]["tardiness"]),
+                    "Expected completion": wm_to_dt(stats[j]["completion"]).strftime("%d %b %Y %H:%M"),
+                    "Due": wm_to_dt(stats[j]["due"]).strftime("%d %b %Y %H:%M"),
+                    "Caused by": stats[j]["cause"]})
+            for j in late_jobs
+        ])
+        st.dataframe(late_df, hide_index=True, use_container_width=True)
+    else:
+        st.caption("No products currently predicted late. 🎉")
+
+    # 6. on-time products
+    st.markdown("**✅ On-time products**")
+    if on_time_jobs:
+        ok_df = pd.DataFrame([
+            dict(Product=f"Product {j}",
+                 **{"Expected completion": wm_to_dt(stats[j]["completion"]).strftime("%d %b %Y %H:%M"),
+                    "Due": wm_to_dt(stats[j]["due"]).strftime("%d %b %Y %H:%M"),
+                    "Slack": core.fmt_wd(stats[j]["due"] - stats[j]["completion"])})
+            for j in on_time_jobs
+        ])
+        st.dataframe(ok_df, hide_index=True, use_container_width=True)
+    else:
+        st.caption("No products currently on time.")
+
+
+render_options_panel()
 
 
 # ---------- header / controls ----------
@@ -77,6 +212,14 @@ if c4.button("↺ Reset"):
     st.session_state.actual_returns = {}
     st.session_state.committed = core.build_schedule(ops, now=0)["plan"]
     st.session_state.playing = False
+    st.session_state.disruption = None
+    st.session_state.decision = None
+    st.session_state.impact_reasoning = None
+    st.session_state.options = None
+    st.session_state.advice = None
+    st.session_state.explanation = None
+    st.session_state.applied_explanation = None
+    st.session_state.cfg = None
     st.rerun()
 
 st.session_state.clock = st.slider("Clock (working-days)", 0.0, round(horizon / MPD, 1),
@@ -97,23 +240,41 @@ with st.expander("Pause and input actual outsource returns, then reschedule", ex
                               min_value=0.0, value=round(planned / MPD, 1), step=0.5,
                               key=f"ar_{o['idx']}_{st.session_state.reset_nonce}")  # CHANGE 3
         inputs[o["idx"]] = int(round(val * MPD)) - committed[o["idx"]]["start"]  # -> actual lead
+        
     if c3.button("⟳ Reschedule") or st.button("Apply actual returns and reschedule"):
-        st.session_state.actual_returns = {i: d for i, d in inputs.items()}
+        ar = {i: d for i, d in inputs.items()}
+        st.session_state.actual_returns = ar
+        st.session_state.applied_explanation = None
+        st.session_state.thread_id += 1
+        cfg = {"configurable": {"thread_id": str(st.session_state.thread_id)}}
+        st.session_state.cfg = cfg
         with st.spinner("ADRS agents reasoning…"):
-            final = adrs_agents.build_app().invoke({       # build fresh, not cached
-                "ops": ops,
-                "committed_plan": committed,
-                "now": int(clock),
-                "actual_returns": st.session_state.actual_returns,
-            })
-        if "reschedule" in final:                      # agent chose to reschedule
-            st.session_state.committed = final["reschedule"]["plan"]
-            committed = final["reschedule"]["plan"]
-        st.info(f"**Detection** — severity: {final['disruption']['severity']}. "
-                f"{final['disruption']['reasoning']}")
-        st.info(f"**Decision** — {final['decision']}. {final['impact_reasoning']}")
-        st.success(final["explanation"])
+            final = st.session_state.graph.invoke(
+                {"ops": ops, "committed_plan": committed,
+                 "now": int(clock), "actual_returns": ar}, cfg)
+        st.session_state.disruption = final["disruption"]
+        st.session_state.decision = final["decision"]
+        st.session_state.impact_reasoning = final["impact_reasoning"]
+        if final.get("__interrupt__"):                 # suspended at human_pick
+            st.session_state.options = final["options"]   # full options (with plan)
+            st.session_state.advice = final["advice"]
+            st.session_state.explanation = None
+        else:                                          # no_action -> finished
+            st.session_state.options = None
+            st.session_state.advice = None
+            st.session_state.explanation = final.get("explanation")
+        st.session_state.opt_nonce = st.session_state.get("opt_nonce", 0) + 1
+        st.rerun()
 
+    if st.session_state.get("disruption"):
+        st.info(f"**Detection** — severity: {st.session_state.disruption['severity']}.")
+        st.info(f"**Decision** — {st.session_state.decision}. {st.session_state.impact_reasoning}")
+    if st.session_state.get("explanation") and not st.session_state.get("options"):
+        st.success(st.session_state.explanation)             # no_action narrative
+    if st.session_state.get("applied_explanation"):
+        st.success(st.session_state.applied_explanation)
+        
+        
 # ---------- Gantt ----------
 left, right = st.columns([1.3, 1])
 with left:
@@ -157,6 +318,9 @@ with right:
     fig2.update_layout(height=460, margin=dict(l=0, r=0, t=10, b=0))
     st.plotly_chart(fig2, use_container_width=True)
 
+
+# statistics
+render_stats_panel() 
 
 st.subheader("Completion Race  🏁")
 jobs = sorted({o["job"] for o in ops})
