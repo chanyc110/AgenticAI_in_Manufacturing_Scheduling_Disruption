@@ -30,7 +30,7 @@ SEED = 42
 LEAD_MIN_DAYS, LEAD_MAX_DAYS = 3, 10
 MIN_PER_DAY = 480
 ORIGIN = datetime(2024, 8, 21, 9, 0)
-PATH = "job_shop_updated.xlsx"
+PATH = "job_shop_staggered_dates.xlsx"
 ASM_STATION = "ASM"
 
 
@@ -76,6 +76,7 @@ def load_ops(path=PATH):
         lead_days = r["Assumed Lead Time (days)"]
         job = int(r["Sr. No"])
         due = to_work_minutes(pd.Timestamp(r["Promised Delivery Date"]).to_pydatetime())
+        release = to_work_minutes(pd.Timestamp(r["Order Processing Date"]).to_pydatetime())
 
         if str(op_type) == "Assembly":
             kind, outsourced = "asm", False
@@ -91,7 +92,7 @@ def load_ops(path=PATH):
 
         ops.append(dict(idx=len(ops), job=job, comp=r["Components"],
                         kind=kind, machine=machine, outsourced=outsourced,
-                        dur=dur, due=due))
+                        dur=dur, due=due, release=release))
     return ops
 
 
@@ -125,15 +126,13 @@ def build_schedule(ops, now=0, frozen=None, actual_leads=None, objective="tardin
     for o in ops:
         i = o["idx"]
         d = _dur(o, actual_leads)
-        lo = 0 if i in frozen else now
+        lo = 0 if i in frozen else max(now, o.get("release", 0))
         si = m.new_int_var(lo, horizon, f"s{i}")
         ei = m.new_int_var(lo, horizon, f"e{i}")
         iv = m.new_interval_var(si, d, ei, f"iv{i}")
         s[i], e[i] = si, ei
         if i in frozen:
             m.add(si == frozen[i])
-            if o["outsourced"]:
-                m.add(si == 0)
         if o["machine"]:
             mach_iv[o["machine"]].append(iv)
 
