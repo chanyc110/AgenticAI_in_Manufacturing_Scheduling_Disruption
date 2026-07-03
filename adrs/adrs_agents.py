@@ -83,7 +83,7 @@ def detection(state: State) -> dict:
     for idx, actual in ar.items():
         o = ops[idx]
         if actual == o["dur"]:
-            continue                      # unchanged field — not a disruption
+            continue
         facts.append(f"Job {o['job']} outsourced {o['comp']}: assumed "
                      f"{core.fmt_wd(o['dur'])}, actual {core.fmt_wd(actual)}, "
                      f"overrun {core.fmt_wd(actual - o['dur'])}")
@@ -100,7 +100,7 @@ def detection(state: State) -> dict:
 # ---------- 3. Impact Assessment ----------
 def impact(state: State) -> dict:
     ops, committed, ar = state["ops"], state["committed_plan"], state["actual_returns"]
-    dn = core.evaluate_donothing(ops, committed, ar, now=state["now"])             # numbers from core
+    dn = core.evaluate_donothing(ops, committed, ar, now=state["now"])
     # only jobs whose actual return actually differs from the assumed lead are "disrupted"
     dis_idx = {i for i in ar if ar[i] != ops[i]["dur"]}
     dis_jobs = {ops[i]["job"] for i in dis_idx}
@@ -110,7 +110,7 @@ def impact(state: State) -> dict:
     coll_txt = ", ".join(f"Job {j} late by {core.fmt_wd(t)}" for j, t in collateral.items()) or "none"
     prompt = (
         "You are the Impact Assessment agent. If we DO NOTHING (keep the current "
-        f"plan), total tardiness is {core.fmt_wd(dn['total_tardiness'])}.\n"
+        f"plan), total tardiness is {core.fmt_wd_words(dn['total_tardiness'])}.\n"
         f"The disrupted job(s) {sorted(dis_jobs)} cannot be recovered — their parts "
         "are physically late, so no schedule change can save them.\n"
         f"Collateral damage (OTHER jobs dragged late only because of the rigid plan): {coll_txt}.\n\n"
@@ -119,12 +119,12 @@ def impact(state: State) -> dict:
         "recovering, else 'no_action'. Justify briefly."
     )
     out = imp_llm.invoke(prompt)
-    decision = "reschedule" if collateral else "no_action"   # deterministic gate
+    decision = "reschedule" if collateral else "no_action"
     return {"donothing": dn, "collateral": collateral, "dis_jobs": sorted(dis_jobs),
             "decision": decision, "impact_reasoning": out.reasoning}
     
     
-# ---------- 4. Objectives layer (runs optimiser once per objective) ----------
+# ---------- 4. Objectives layer ----------
 def objectives(state: State) -> dict:
     opts = core.generate_options(state["ops"], state["committed_plan"],
                                  state["now"], state["actual_returns"])

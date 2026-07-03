@@ -51,6 +51,12 @@ def to_work_minutes(dt):
 def fmt_wd(mins):
     return f"{mins / MIN_PER_DAY:.1f}wd"
 
+def fmt_wd_words(mins):
+    """Same value as fmt_wd, but spelled out in full — use this in any text that
+    goes into an LLM prompt. 'wd' is fine for on-screen display; it is genuinely
+    ambiguous to a language model (e.g. can be misread as 'weeks')."""
+    return f"{mins / MIN_PER_DAY:.1f} working-days"
+
 
 # ---------- data ----------
 def load_ops(path=PATH):
@@ -104,11 +110,8 @@ def _dur(o, actual_leads):
 
 
 # ---------- scheduler ----------
-def build_schedule(ops, now=0, frozen=None, actual_leads=None, objective="tardiness", reference_plan=None, time_limit=20):
-    """Solve the (possibly partial) problem from `now`.
-    frozen: {idx: start} operations pinned to a fixed start (already begun / known).
-    actual_leads: {idx: minutes} real outsource durations that override the assumption.
-    """
+def build_schedule(ops, now=0, frozen=None, actual_leads=None, objective="tardiness",
+                   reference_plan=None, time_limit=20):
     now = int(now)
     frozen = {int(k): int(v) for k, v in (frozen or {}).items()}
     actual_leads = {int(k): int(v) for k, v in (actual_leads or {}).items()}
@@ -130,7 +133,7 @@ def build_schedule(ops, now=0, frozen=None, actual_leads=None, objective="tardin
         if i in frozen:
             m.add(si == frozen[i])
             if o["outsourced"]:
-                m.add(si == 0)        # dispatched at release; return time = lead time
+                m.add(si == 0)
         if o["machine"]:
             mach_iv[o["machine"]].append(iv)
 
@@ -216,9 +219,9 @@ def evaluate_donothing(ops, committed, actual_leads, now=0):
         cstart = committed[o["idx"]]["start"]
         ready = max(comp_end[c["idx"]] for c in ops
                     if c["job"] == o["job"] and c["kind"] == "comp")
-        if cstart < now:                      # frozen: already started before now
+        if cstart < now:
             start = cstart
-        else:                                 # not yet started: right-shift around now
+        else:
             start = max(clock, ready, now)
         end = start + o["dur"]
         clock = max(clock, end)

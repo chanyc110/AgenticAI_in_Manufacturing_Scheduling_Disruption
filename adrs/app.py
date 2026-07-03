@@ -240,7 +240,8 @@ with st.expander("Pause and input actual outsource returns, then reschedule", ex
                               min_value=0.0, value=round(planned / MPD, 1), step=0.5,
                               key=f"ar_{o['idx']}_{st.session_state.reset_nonce}")  # CHANGE 3
         inputs[o["idx"]] = int(round(val * MPD)) - committed[o["idx"]]["start"]  # -> actual lead
-        
+    
+    
     if c3.button("⟳ Reschedule") or st.button("Apply actual returns and reschedule"):
         ar = {i: d for i, d in inputs.items()}
         st.session_state.actual_returns = ar
@@ -251,7 +252,7 @@ with st.expander("Pause and input actual outsource returns, then reschedule", ex
         with st.spinner("ADRS agents reasoning…"):
             final = st.session_state.graph.invoke(
                 {"ops": ops, "committed_plan": committed,
-                 "now": int(clock), "actual_returns": ar}, cfg)
+                 "now": int(clock), "actual_returns": ar}, cfg)            
         st.session_state.disruption = final["disruption"]
         st.session_state.decision = final["decision"]
         st.session_state.impact_reasoning = final["impact_reasoning"]
@@ -274,30 +275,67 @@ with st.expander("Pause and input actual outsource returns, then reschedule", ex
     if st.session_state.get("applied_explanation"):
         st.success(st.session_state.applied_explanation)
         
-        
+
 # ---------- Gantt ----------
 left, right = st.columns([1.3, 1])
 with left:
-    st.subheader("Gantt Chart (by product)")
-    actual = st.session_state.actual_returns
-    rows = []
-    for o in ops:
-        dur = actual.get(o["idx"], o["dur"]) if o["outsourced"] else o["dur"]
-        label = "OutSrc" if o["outsourced"] else o["comp"]   # 'Assembly' for the asm row
-        rows.append(dict(Product=f"Product {o['job']}", Component=label,
-                         WD=dur / MPD, Hours=round(dur / 60, 1)))
-    gdf = pd.DataFrame(rows)
-    comp_order = ["C1", "C2", "C3", "C4", "C5", "C6", "OutSrc", "Assembly"]
-    prod_order = [f"Product {j}" for j in sorted({o['job'] for o in ops})]
-    fig = px.bar(gdf, x="WD", y="Product", color="Component", orientation="h",
-                 color_discrete_map=COMP_COLORS,
-                 category_orders={"Component": comp_order, "Product": prod_order},
-                 hover_data={"Hours": True, "WD": ":.2f"})
-    fig.update_yaxes(autorange="reversed")
-    fig.update_layout(barmode="stack", height=480, legend_title="Component",
-                      xaxis_title="processing time, stacked by component (working-days)",
-                      margin=dict(l=0, r=0, t=10, b=0))
-    st.plotly_chart(fig, use_container_width=True)
+    tab1, tab2 = st.tabs(["Overview (by product)", "Sequence & parallelism (real time)"])
+
+    with tab1:
+        actual = st.session_state.actual_returns
+        rows = []
+        for o in ops:
+            dur = actual.get(o["idx"], o["dur"]) if o["outsourced"] else o["dur"]
+            label = "OutSrc" if o["outsourced"] else o["comp"]
+            rows.append(dict(Product=f"Product {o['job']}", Component=label,
+                             WD=dur / MPD, Hours=round(dur / 60, 1)))
+        gdf = pd.DataFrame(rows)
+        comp_order = ["C1", "C2", "C3", "C4", "C5", "C6", "OutSrc", "Assembly"]
+        prod_order = [f"Product {j}" for j in sorted({o["job"] for o in ops})]
+        fig = px.bar(gdf, x="WD", y="Product", color="Component", orientation="h",
+                     color_discrete_map=COMP_COLORS,
+                     category_orders={"Component": comp_order, "Product": prod_order},
+                     hover_data={"Hours": True, "WD": ":.2f"})
+        fig.update_yaxes(autorange="reversed")
+        fig.update_layout(barmode="stack", height=520, legend_title="Component",
+                          xaxis_title="processing time, stacked by component (working-days)",
+                          margin=dict(l=0, r=0, t=10, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Composition summary — total workload per product. Not a real timeline.")
+
+    with tab2:
+        actual = st.session_state.actual_returns
+        prod_order = [f"Product {j}" for j in sorted({o["job"] for o in ops})]
+
+        fig2 = go.Figure()
+        seen = set()
+        for o in ops:
+            p = committed[o["idx"]]
+            dur = actual.get(o["idx"], o["dur"]) if o["outsourced"] else o["dur"]
+            label = "OutSrc" if o["outsourced"] else o["comp"]
+            fig2.add_trace(go.Bar(
+                y=[f"Product {o['job']}"], x=[dur / MPD], base=[p["start"] / MPD],
+                orientation="h",
+                marker=dict(color=COMP_COLORS.get(label, "#888"), opacity=0.85,
+                           line=dict(width=0.5, color="#111")),
+                name=label, legendgroup=label, showlegend=(label not in seen),
+                text=label, textposition="inside", insidetextanchor="middle",
+                textangle=0, constraintext="none",
+                hovertemplate=(f"Product {o['job']} · {label}<br>"
+                              f"start {p['start']/MPD:.2f} wd<br>"
+                              f"duration {dur/MPD:.2f} wd ({dur/60:.1f} h)<extra></extra>")))
+            seen.add(label)
+
+        fig2.add_vline(x=clock / MPD, line_width=2, line_dash="dash", line_color="white")
+        fig2.update_layout(barmode="overlay", height=520, legend_title="Component",
+                          yaxis=dict(categoryorder="array",
+                                    categoryarray=list(reversed(prod_order))),
+                          xaxis_title="working-days from release (Aug 21)",
+                          margin=dict(l=0, r=0, t=10, b=0))
+        st.plotly_chart(fig2, use_container_width=True)
+        st.caption("Real timeline — bar position = actual scheduled time. Overlapping bars on "
+                  "a product's row mean genuine parallel work on different machines. Hover any "
+                  "bar for exact start/duration; box-zoom to inspect short operations.")
 
 # ---------- component status grid ----------
 with right:
