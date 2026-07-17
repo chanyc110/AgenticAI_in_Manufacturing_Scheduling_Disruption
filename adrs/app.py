@@ -9,8 +9,10 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import plotly.graph_objects as go
+import streamlit.components.v1 as components
 import adrs_core as core
 import adrs_agents
+import adrs_simulation
 from langgraph.types import Command
 
 st.set_page_config(page_title="ADRS Simulation", layout="wide")
@@ -80,6 +82,72 @@ def op_status(o, clock):
         return "Late" if clock > due else "InProgress_In House"
     return "Not started"
 
+
+def render_option_kpis(option, ops):
+    """Headline whole-plan KPIs for this option: tardiness, makespan, churn,
+    ASM utilisation, and average queueing waits -- computed once per option,
+    not clock-dependent."""
+    det = core.option_deterministic_stats(ops, option["plan"], st.session_state.actual_returns)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Tardiness", core.fmt_wd(option["total_tardiness"]))
+    k2.metric("Makespan", core.fmt_wd(option["makespan"]))
+    k3.metric("Ops moved", option["ops_changed"])
+    k4.metric("ASM utilisation", f"{det['asm_utilisation_pct']:.0f}%")
+    k5.metric("Avg in-house wait", core.fmt_wd(det["avg_inhouse_wait"]))
+    k6.metric("Avg ASM wait", core.fmt_wd(det["avg_asm_wait"]))
+
+
+def render_option_stats(option, ops):
+    """Static, whole-plan statistics for this option: per-machine utilisation,
+    workload (queue length), and average wait, plus per-product completion times."""
+    plan = option["plan"]
+    util = core.compute_machine_utilisation(ops, plan)
+    waits = core.compute_waiting_times(ops, plan, st.session_state.actual_returns)
+    stats = core.compute_job_stats(ops, plan, st.session_state.actual_returns)
+
+    machine_of = {(o["job"], o["comp"]): o["machine"] for o in ops
+                 if o["kind"] == "comp" and not o["outsourced"]}
+    wait_by_machine = {}
+    for w in waits:
+        if w["kind"] == "in-house":
+            mc = machine_of.get((w["job"], w["comp"]))
+            if mc:
+                wait_by_machine.setdefault(mc, []).append(w["wait"])
+
+    machines = sorted({o["machine"] for o in ops if o["machine"] and o["machine"] != core.ASM_STATION})
+    rows = []
+    for mc in machines:
+        n_ops = sum(1 for o in ops if o["machine"] == mc)
+        wlist = wait_by_machine.get(mc, [])
+        rows.append(dict(Machine=mc, **{
+            "Utilisation": f"{util.get(mc, {}).get('pct', 0):.0f}%",
+            "Queue length (total jobs)": n_ops,
+            "Avg wait": core.fmt_wd(sum(wlist) / len(wlist)) if wlist else "0.0wd",
+        }))
+    asm_waits = [w["wait"] for w in waits if w["kind"] == "assembly"]
+    n_asm = sum(1 for o in ops if o["kind"] == "asm")
+    rows.append(dict(Machine="ASM", **{
+        "Utilisation": f"{util.get(core.ASM_STATION, {}).get('pct', 0):.0f}%",
+        "Queue length (total jobs)": n_asm,
+        "Avg wait": core.fmt_wd(sum(asm_waits) / len(asm_waits)) if asm_waits else "0.0wd",
+    }))
+    st.markdown("**Machine statistics**")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                key=f"machinestats_{option['objective']}")
+
+    st.markdown("**Product completion times**")
+    comp_rows = []
+    for j in sorted(stats):
+        s = stats[j]
+        comp_rows.append(dict(Product=f"P{j}", **{
+            "Completion time": core.fmt_wd(s["completion"]),
+            "Due": core.fmt_wd(s["due"]),
+            "Status": "On time" if s["on_time"] else f"Late by {core.fmt_wd(s['tardiness'])}",
+        }))
+    st.dataframe(pd.DataFrame(comp_rows), hide_index=True, use_container_width=True,
+                key=f"completiontimes_{option['objective']}")
+
+
 def render_options_panel():
     opts = st.session_state.get("options")
     advice = st.session_state.get("advice")
@@ -104,6 +172,23 @@ def render_options_panel():
         if ex:
             st.caption(f"• **{o['label']}** — {ex}")
 
+    selected = opts[choice]
+    render_option_kpis(selected, ops)
+
+    st.markdown("**🏭 Factory-floor simulation**")
+    st.caption("Runs a discrete-event simulation (SimPy) of the selected option and opens it "
+               "as an animated factory floor in a new browser tab. The KPIs shown there are "
+               "measured live from the simulation itself (arrival/start/end of every "
+               "operation), not read off the optimiser's plan.")
+    sim_result = adrs_simulation.simulate(ops, selected["plan"], st.session_state.actual_returns)
+    widget = adrs_simulation.build_launch_widget(
+        ops, selected["plan"], st.session_state.actual_returns,
+        option_label=selected["label"], sim_result=sim_result)
+    components.html(widget, height=70)
+
+    with st.expander("Machine & product statistics for this option"):
+        render_option_stats(selected, ops)
+
     if st.button("✓ Apply selected plan"):
         chosen = opts[choice]
         cfg = st.session_state.cfg
@@ -119,8 +204,8 @@ def render_options_panel():
         st.session_state.options = None
         st.session_state.advice = None
         st.rerun()
-        
-        
+
+
 def render_stats_panel():
     st.subheader("📊 Schedule Statistics")
 
@@ -277,84 +362,108 @@ with st.expander("Pause and input actual outsource returns, then reschedule", ex
         
 
 # ---------- Gantt ----------
-left, right = st.columns([1.3, 1])
-with left:
-    tab1, tab2 = st.tabs(["Overview (by product)", "Sequence & parallelism (real time)"])
 
-    with tab1:
-        actual = st.session_state.actual_returns
-        rows = []
-        for o in ops:
-            dur = actual.get(o["idx"], o["dur"]) if o["outsourced"] else o["dur"]
-            label = "OutSrc" if o["outsourced"] else o["comp"]
-            rows.append(dict(Product=f"Product {o['job']}", Component=label,
-                             WD=dur / MPD, Hours=round(dur / 60, 1)))
-        gdf = pd.DataFrame(rows)
-        comp_order = ["C1", "C2", "C3", "C4", "C5", "C6", "OutSrc", "Assembly"]
-        prod_order = [f"Product {j}" for j in sorted({o["job"] for o in ops})]
-        fig = px.bar(gdf, x="WD", y="Product", color="Component", orientation="h",
-                     color_discrete_map=COMP_COLORS,
-                     category_orders={"Component": comp_order, "Product": prod_order},
-                     hover_data={"Hours": True, "WD": ":.2f"})
-        fig.update_yaxes(autorange="reversed")
-        fig.update_layout(barmode="stack", height=520, legend_title="Component",
-                          xaxis_title="processing time, stacked by component (working-days)",
-                          margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("Composition summary — total workload per product. Not a real timeline.")
+tab1, tab2 = st.tabs([ "Sequence & parallelism (real time)", "By machine"])
 
-    with tab2:
-        actual = st.session_state.actual_returns
-        prod_order = [f"Product {j}" for j in sorted({o["job"] for o in ops})]
+with tab1:
+    actual = st.session_state.actual_returns
+    prod_order = [f"Product {j}" for j in sorted({o["job"] for o in ops})]
 
-        fig2 = go.Figure()
-        seen = set()
-        for o in ops:
-            p = committed[o["idx"]]
-            dur = actual.get(o["idx"], o["dur"]) if o["outsourced"] else o["dur"]
-            label = "OutSrc" if o["outsourced"] else o["comp"]
-            fig2.add_trace(go.Bar(
-                y=[f"Product {o['job']}"], x=[dur / MPD], base=[p["start"] / MPD],
-                orientation="h",
-                marker=dict(color=COMP_COLORS.get(label, "#888"), opacity=0.85,
-                           line=dict(width=0.5, color="#111")),
-                name=label, legendgroup=label, showlegend=(label not in seen),
-                text=label, textposition="inside", insidetextanchor="middle",
-                textangle=0, constraintext="none",
-                hovertemplate=(f"Product {o['job']} · {label}<br>"
-                              f"start {p['start']/MPD:.2f} wd<br>"
-                              f"duration {dur/MPD:.2f} wd ({dur/60:.1f} h)<extra></extra>")))
-            seen.add(label)
+    fig2 = go.Figure()
+    seen = set()
+    for o in ops:
+        p = committed[o["idx"]]
+        dur = actual.get(o["idx"], o["dur"]) if o["outsourced"] else o["dur"]
+        label = "OutSrc" if o["outsourced"] else o["comp"]
+        mc = o["machine"] if o["machine"] else "Outsourced (off-site)"
+        fig2.add_trace(go.Bar(
+            y=[f"Product {o['job']}"], x=[dur / MPD], base=[p["start"] / MPD],
+            orientation="h",
+            marker=dict(color=COMP_COLORS.get(label, "#888"), opacity=0.85,
+                    line=dict(width=0.5, color="#111")),
+            name=label, legendgroup=label, showlegend=(label not in seen),
+            text=label, textposition="inside", insidetextanchor="middle",
+            textangle=0, constraintext="none",
+            hovertemplate=(f"Product {o['job']} · {label}<br>"
+                        f"Machine: {mc}<br>"
+                        f"start {p['start']/MPD:.2f} wd<br>"
+                        f"duration {dur/MPD:.2f} wd ({dur/60:.1f} h)<extra></extra>")))
+        fig2.add_trace(go.Bar(
+            y=[f"Product {o['job']}"], x=[dur / MPD], base=[p["start"] / MPD],
+            orientation="h",
+            marker=dict(color=COMP_COLORS.get(label, "#888"), opacity=0.85,
+                        line=dict(width=0.5, color="#111")),
+            name=label, legendgroup=label, showlegend=(label not in seen),
+            text=label, textposition="inside", insidetextanchor="middle",
+            textangle=0, constraintext="none",
+            hovertemplate=(f"Product {o['job']} · {label}<br>"
+                            f"start {p['start']/MPD:.2f} wd<br>"
+                            f"duration {dur/MPD:.2f} wd ({dur/60:.1f} h)<extra></extra>")))
+        seen.add(label)
 
-        fig2.add_vline(x=clock / MPD, line_width=2, line_dash="dash", line_color="white")
-        fig2.update_layout(barmode="overlay", height=520, legend_title="Component",
-                          yaxis=dict(categoryorder="array",
-                                    categoryarray=list(reversed(prod_order))),
-                          xaxis_title="working-days from release (Aug 21)",
-                          margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig2, use_container_width=True)
-        st.caption("Real timeline — bar position = actual scheduled time. Overlapping bars on "
-                  "a product's row mean genuine parallel work on different machines. Hover any "
-                  "bar for exact start/duration; box-zoom to inspect short operations.")
+    fig2.add_vline(x=clock / MPD, line_width=2, line_dash="dash", line_color="white")
+    fig2.update_layout(barmode="overlay", height=760, legend_title="Component",
+                        yaxis=dict(categoryorder="array",
+                                categoryarray=list(reversed(prod_order))),
+                        xaxis_title="working-days from release (Aug 21)",
+                        margin=dict(l=0, r=0, t=10, b=0))
+    st.plotly_chart(fig2, use_container_width=True)
+    st.caption("Real timeline — bar position = actual scheduled time. Overlapping bars on "
+                "a product's row mean genuine parallel work on different machines. Hover any "
+                "bar for exact start/duration; box-zoom to inspect short operations.")
+    
+with tab2:
+    actual = st.session_state.actual_returns
+    jobs = sorted({o["job"] for o in ops})
+    palette = px.colors.qualitative.Plotly
+    cmap = {j: palette[(j - 1) % len(palette)] for j in jobs}
+    out_rows = sorted({f"OutSrc P{o['job']}" for o in ops if o["outsourced"]})
+    order = out_rows + ["ASM", "M6", "M5", "M4", "M3", "M2", "M1"]
+        
+    fig3 = go.Figure()
+    seen = set()
+    for o in ops:
+        p = committed[o["idx"]]
+        dur = actual.get(o["idx"], o["dur"]) if o["outsourced"] else o["dur"]
+        resource = f"OutSrc P{o['job']}" if o["outsourced"] else o["machine"]
+        fig3.add_trace(go.Bar(
+            y=[resource], x=[dur / MPD], base=[p["start"] / MPD], orientation="h",
+            marker_color=cmap[o["job"]], marker_line_width=0.5, marker_line_color="#111",
+            text=f"P{o['job']}·{o['comp']}", textposition="inside", insidetextanchor="middle",
+            textangle=0, constraintext="none", cliponaxis=False,
+            legendgroup=f"P{o['job']}", name=f"P{o['job']}",
+            showlegend=(o["job"] not in seen),
+            hovertemplate=(f"<b>P{o['job']} · {o['comp']}</b><br>"
+                        f"Machine: {resource}<br>"
+                        f"start: {p['start']/MPD:.2f} wd<br>"
+                        f"duration: {dur/MPD:.2f} wd ({dur/60:.1f} h)<extra></extra>")))
+        seen.add(o["job"])
+
+    fig3.add_vline(x=clock / MPD, line_width=2, line_dash="dash", line_color="white")
+    fig3.update_layout(barmode="overlay", height=760, bargap=0.15,
+                    xaxis_title="working-days from release (Aug 21)",
+                    yaxis=dict(categoryorder="array", categoryarray=order),
+                    legend_title="Product", margin=dict(l=0, r=0, t=10, b=0))
+    st.plotly_chart(fig3, use_container_width=True)
 
 # ---------- component status grid ----------
-with right:
-    st.subheader("Product Components Status")
-    pts = []
-    for o in ops:
-        if o["kind"] != "comp":
-            continue
-        pts.append(dict(Product=f"Product {o['job']}", Component=o["comp"],
-                        Status=op_status(o, clock),
-                        Machine=("OutSrc" if o["outsourced"] else o["machine"])))
-    sdf = pd.DataFrame(pts)
-    fig2 = px.scatter(sdf, x="Product", y="Component", color="Status", text="Machine",
-                      color_discrete_map=STATUS_COLORS,
-                      category_orders={"Component": ["C1", "C2", "C3", "C4", "C5", "C6"]})
-    fig2.update_traces(marker=dict(size=26, symbol="square"), textposition="top center")
-    fig2.update_yaxes(autorange="reversed")
-    fig2.update_layout(height=460, margin=dict(l=0, r=0, t=10, b=0))
-    st.plotly_chart(fig2, use_container_width=True)
+
+st.subheader("Product Components Status")
+pts = []
+for o in ops:
+    if o["kind"] != "comp":
+        continue
+    pts.append(dict(Product=f"Product {o['job']}", Component=o["comp"],
+                    Status=op_status(o, clock),
+                    Machine=("OutSrc" if o["outsourced"] else o["machine"])))
+sdf = pd.DataFrame(pts)
+fig2 = px.scatter(sdf, x="Product", y="Component", color="Status", text="Machine",
+                    color_discrete_map=STATUS_COLORS,
+                    category_orders={"Component": ["C1", "C2", "C3", "C4", "C5", "C6"]})
+fig2.update_traces(marker=dict(size=26, symbol="square"), textposition="top center")
+fig2.update_yaxes(autorange="reversed")
+fig2.update_layout(height=460, margin=dict(l=0, r=0, t=10, b=0))
+st.plotly_chart(fig2, use_container_width=True)
 
 
 # statistics

@@ -92,7 +92,7 @@ def load_ops(path=PATH):
 
         ops.append(dict(idx=len(ops), job=job, comp=r["Components"],
                         kind=kind, machine=machine, outsourced=outsourced,
-                        dur=dur, due=due, release=release))
+                        dur=dur, due=due, release=release, qty=int(qty)))
     return ops
 
 
@@ -105,7 +105,7 @@ def assembly_index(ops, job):
 
 
 def _dur(o, actual_leads):
-    if o["outsourced"] and o["idx"] in actual_leads:
+    if o["idx"] in actual_leads:     
         return actual_leads[o["idx"]]
     return o["dur"]
 
@@ -116,7 +116,8 @@ def build_schedule(ops, now=0, frozen=None, actual_leads=None, objective="tardin
     now = int(now)
     frozen = {int(k): int(v) for k, v in (frozen or {}).items()}
     actual_leads = {int(k): int(v) for k, v in (actual_leads or {}).items()}
-    horizon = sum(_dur(o, actual_leads) for o in ops) + max(o["due"] for o in ops) + MIN_PER_DAY * 40
+    extra_buffer = MIN_PER_DAY * 40 + sum(actual_leads.values())
+    horizon = sum(_dur(o, actual_leads) for o in ops) + max(o["due"] for o in ops) + extra_buffer
 
     m = cp_model.CpModel()
     s, e = {}, {}
@@ -172,8 +173,9 @@ def build_schedule(ops, now=0, frozen=None, actual_leads=None, objective="tardin
     else:
         stability = 0
 
+    sum_starts = sum(s[o["idx"]] for o in ops)
     OBJECTIVES = {
-        "tardiness": total_tard * 100000 + mk,
+        "tardiness": total_tard * 100000 + mk * 10 + sum_starts * 0.001,
         "makespan":  mk * 100000 + total_tard,
         "stability": stability * 100000 + total_tard * 100 + mk,   # stability now dominates
         "balanced":  total_tard * 50 + stability * 30 + mk,        # genuine blend, tuned
@@ -234,13 +236,16 @@ def evaluate_donothing(ops, committed, actual_leads, now=0):
 def reschedule_from(ops, committed, now, actual_returns):
     """Frozen-horizon complete reschedule. Pin everything that has begun before
     `now`, enforce the known actual outsource return(s), and re-optimise the rest."""
+    disrupted_jobs = {ops[i]["job"] for i in actual_returns}
     frozen = {}
     for o in ops:
         i = o["idx"]
         st = committed[i]["start"]
-        if i in actual_returns:           # disrupted outsource: enforce real return
+        if i in actual_returns:
             frozen[i] = st
-        elif st < now:                    # already started/finished in reality
+        elif o["kind"] == "asm" and o["job"] in disrupted_jobs:
+            continue        # never freeze a disrupted job's own assembly
+        elif st < now:
             frozen[i] = st
     return build_schedule(ops, now=now, frozen=frozen, actual_leads=actual_returns)
 
@@ -263,11 +268,16 @@ def plan_tardiness(ops, plan):
 def generate_options(ops, committed, now, actual_returns,
                      objectives=("tardiness", "makespan", "stability", "balanced")):
     """Objectives layer: run the optimiser once per objective -> a set of option plans."""
+    disrupted_jobs = {ops[i]["job"] for i in actual_returns}
     frozen = {}
     for o in ops:
         i = o["idx"]
         st = committed[i]["start"]
-        if i in actual_returns or st < now:
+        if i in actual_returns:
+            frozen[i] = st
+        elif o["kind"] == "asm" and o["job"] in disrupted_jobs:
+            continue        # never freeze a disrupted job's own assembly
+        elif st < now:
             frozen[i] = st
     options = []
     for obj in objectives:
@@ -345,6 +355,23 @@ def compute_waiting_times(ops, plan, actual_leads=None):
             wait = max(0, plan[o["idx"]]["start"] - ready)
             rows.append(dict(job=o["job"], comp="Assembly", kind="assembly", wait=wait))
     return rows
+
+
+
+
+def option_deterministic_stats(ops, plan, actual_leads=None):
+    """Headline deterministic stats for one option's plan: ASM utilisation and
+    average queueing waits — the same underlying numbers as the main stats panel,
+    just summarised to one number per metric for a compact side-by-side view."""
+    util = compute_machine_utilisation(ops, plan)
+    waits = compute_waiting_times(ops, plan, actual_leads)
+    inhouse = [w["wait"] for w in waits if w["kind"] == "in-house"]
+    asm_w = [w["wait"] for w in waits if w["kind"] == "assembly"]
+    return dict(
+        asm_utilisation_pct=util.get(ASM_STATION, {}).get("pct", 0),
+        avg_inhouse_wait=(sum(inhouse) / len(inhouse)) if inhouse else 0,
+        avg_asm_wait=(sum(asm_w) / len(asm_w)) if asm_w else 0,
+    )
 
 
 # ---------- demo ----------

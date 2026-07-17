@@ -9,7 +9,7 @@ Explainability-> LLM narrates what changed and why, for a human planner
 
 Division of labour: every number comes from adrs_core; the LLM never does the maths.
 """
-from typing import TypedDict, Literal, Any, Optional
+from typing import TypedDict, Literal
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -39,12 +39,15 @@ imp_llm = llm.with_structured_output(ImpactOut)
 
 class OptionLine(BaseModel):
     objective: str = Field(description="the option's objective key")
-    explanation: str = Field(description="one plain sentence: what it prioritises and its trade-off vs the others")
+    explanation: str = Field(description="one plain sentence: what this option prioritises and its trade-off vs the others")
 
+
+## have to decide whether you want the AI agent to reccomend or use a deterministic formula to reccomend.
+## currently its deterministic and agent explains
 class OptionsAdvice(BaseModel):
     lines: list[OptionLine]
-    recommended: Literal["tardiness", "makespan", "stability", "balanced"]
-    reason: str = Field(description="one sentence: why the recommended option is the sensible default")
+    reason: str = Field(description="one sentence justifying the already-chosen recommended option, "
+                                    "referencing its tardiness and how many operations it moves")
 
 adv_llm = llm.with_structured_output(OptionsAdvice)
 
@@ -107,21 +110,28 @@ def impact(state: State) -> dict:
     late = {j: t for j, t in dn["tardiness"].items() if t > 0}
     collateral = {j: t for j, t in late.items() if j not in dis_jobs}
 
-    coll_txt = ", ".join(f"Job {j} late by {core.fmt_wd(t)}" for j, t in collateral.items()) or "none"
+    coll_txt = ", ".join(f"Job {j} late by {core.fmt_wd_words(t)}" for j, t in collateral.items()) or "none"
     prompt = (
-        "You are the Impact Assessment agent. If we DO NOTHING (keep the current "
-        f"plan), total tardiness is {core.fmt_wd_words(dn['total_tardiness'])}.\n"
-        f"The disrupted job(s) {sorted(dis_jobs)} cannot be recovered — their parts "
+        "You are the Impact Assessment agent for a production scheduler. Decide whether "
+        "to trigger a full reschedule, based on these facts:\n\n"
+        f"If we DO NOTHING (keep the current plan), total tardiness across all jobs is "
+        f"{core.fmt_wd_words(dn['total_tardiness'])}.\n"
+        f"The disrupted job(s) {sorted(dis_jobs)} cannot be recovered — their own parts "
         "are physically late, so no schedule change can save them.\n"
-        f"Collateral damage (OTHER jobs dragged late only because of the rigid plan): {coll_txt}.\n\n"
+        f"Collateral damage (OTHER jobs dragged late only because the plan wasn't "
+        f"re-sequenced): {coll_txt}.\n\n"
         "Rescheduling re-optimises the shared assembly queue and can only help the "
-        "collateral jobs. Choose 'reschedule' if there is collateral damage worth "
-        "recovering, else 'no_action'. Justify briefly."
+        "collateral jobs — it cannot help the disrupted job(s) above. Rescheduling also "
+        "has a real cost: it disrupts the current plan and consumes planner attention, "
+        "so it should only be triggered when the collateral damage is genuinely worth "
+        "recovering. As a rough guide: a few minutes of collateral lateness usually "
+        "isn't worth acting on; multiple hours or more generally is. Decide 'reschedule' "
+        "or 'no_action', and justify your decision in one sentence, referencing the "
+        "specific collateral jobs and magnitudes."
     )
     out = imp_llm.invoke(prompt)
-    decision = "reschedule" if collateral else "no_action"
     return {"donothing": dn, "collateral": collateral, "dis_jobs": sorted(dis_jobs),
-            "decision": decision, "impact_reasoning": out.reasoning}
+            "decision": out.decision, "impact_reasoning": out.reasoning}
     
     
 # ---------- 4. Objectives layer ----------
@@ -131,9 +141,18 @@ def objectives(state: State) -> dict:
     return {"options": opts}
 
 
+
+def _recommendation_score(option):
+    """Lower is better: fewest late deliveries first, fewest operations moved as
+    tiebreak. Deterministic — the LLM never chooses this, only explains it."""
+    return (option["total_tardiness"], option["ops_changed"])
+
+
 # ---------- 5. Options Advisor (compares options, recommends one) ----------
 def options_advisor(state: State) -> dict:
     opts = state["options"]
+    recommended = min(opts, key=_recommendation_score)["objective"]
+
     summary = "\n".join(
         f"{o['objective']} ({o['label']}): tardiness {core.fmt_wd(o['total_tardiness'])}, "
         f"makespan {core.fmt_wd(o['makespan'])}, {o['ops_changed']} operations moved"
@@ -143,11 +162,14 @@ def options_advisor(state: State) -> dict:
         "You are the Options Advisor agent for a production planner. Four rescheduling "
         "options were produced, each optimising a different objective. For EACH option, "
         "write one plain sentence on what it prioritises and its trade-off compared with "
-        "the others. Then recommend ONE option as the sensible default and justify in one "
-        "sentence. Prefer the option with lowest tardiness; break ties by fewest operations "
-        f"moved (less disruption).\n\nDisruption: {facts}\n\nOptions:\n{summary}")
+        "the others.\n\n"
+        f"The recommended option has ALREADY been chosen (fewest late deliveries, then "
+        f"fewest operations moved as tiebreak): it is '{recommended}'. Write one sentence "
+        "justifying why this is the sensible default.\n\n"
+        f"Disruption: {facts}\n\nOptions:\n{summary}"
+    )
     out = adv_llm.invoke(prompt)
-    return {"advice": dict(recommended=out.recommended, reason=out.reason,
+    return {"advice": dict(recommended=recommended, reason=out.reason,
                            explanations={l.objective: l.explanation for l in out.lines})}
     
     
@@ -219,7 +241,7 @@ def build_app():
     g.add_node("detection", detection)
     g.add_node("impact", impact)
     g.add_node("objectives", objectives)
-    g.add_node("options_advisor", options_advisor)
+    g.add_node("options_advisor", options_advisor) 
     g.add_node("human_pick", human_pick)
     g.add_node("explainability", explainability)   # used on the no_action branch
 
