@@ -27,10 +27,11 @@ from datetime import datetime, timedelta
 from ortools.sat.python import cp_model
 
 SEED = 42
+DEFAULT_TIME_LIMIT = 20
 LEAD_MIN_DAYS, LEAD_MAX_DAYS = 3, 10
 MIN_PER_DAY = 480
 ORIGIN = datetime(2024, 8, 21, 9, 0)
-PATH = "job_shop_staggered_dates.xlsx"
+PATH = "job_shop_20products_tight.xlsx"
 ASM_STATION = "ASM"
 
 
@@ -112,7 +113,8 @@ def _dur(o, actual_leads):
 
 # ---------- scheduler ----------
 def build_schedule(ops, now=0, frozen=None, actual_leads=None, objective="tardiness",
-                   reference_plan=None, time_limit=20):
+                   reference_plan=None, time_limit=None):
+    time_limit = DEFAULT_TIME_LIMIT if time_limit is None else time_limit
     now = int(now)
     frozen = {int(k): int(v) for k, v in (frozen or {}).items()}
     actual_leads = {int(k): int(v) for k, v in (actual_leads or {}).items()}
@@ -173,12 +175,37 @@ def build_schedule(ops, now=0, frozen=None, actual_leads=None, objective="tardin
     else:
         stability = 0
 
-    sum_starts = sum(s[o["idx"]] for o in ops)
+    # ---- outsourced-driven priority weighting ----
+    # If job j's outsourced part is KNOWN (via actual_leads) to be returning
+    # later than assumed, finishing j's OWN in-house/assembly components early
+    # gives j's own tardiness no benefit at all -- assembly is gated by
+    # whichever finishes last, and the late outsourced part already dominates.
+    # Previously the tie-break term (sum_starts) was direction-agnostic: it
+    # rewarded EVERY operation starting earlier, including j's now-pointless
+    # ones, which could win machine priority over other jobs' components for
+    # no real benefit (confirmed empirically: this was inconsistent, sometimes
+    # even prioritising the disrupted job's own components). Give those
+    # specific components a reduced/negative weight instead, so machine
+    # contention actively favours other jobs rather than leaving the outcome
+    # to arbitrary solver tie-breaking.
+    late_disrupted_jobs = {
+        o["job"] for o in ops
+        if o["outsourced"] and o["idx"] in actual_leads and actual_leads[o["idx"]] > o["dur"]
+    }
+    DEPRIORITIZE_WEIGHT = -2.0
+
+    def _priority_weight(o):
+        if o["job"] in late_disrupted_jobs and o["kind"] in ("comp", "asm") and not o["outsourced"]:
+            return DEPRIORITIZE_WEIGHT
+        return 1.0
+
+    weighted_sum_starts = sum(_priority_weight(o) * s[o["idx"]] for o in ops)
+
     OBJECTIVES = {
-        "tardiness": total_tard * 100000 + mk * 10 + sum_starts * 0.001,
-        "makespan":  mk * 100000 + total_tard,
+        "tardiness": total_tard * 100000 + mk * 10 + weighted_sum_starts * 0.001,
+        "makespan":  mk * 100000 + total_tard + weighted_sum_starts * 0.001,
         "stability": stability * 100000 + total_tard * 100 + mk,   # stability now dominates
-        "balanced":  total_tard * 50 + stability * 30 + mk,        # genuine blend, tuned
+        "balanced":  total_tard * 50 + stability * 30 + mk + weighted_sum_starts * 0.01,
     }
     m.minimize(OBJECTIVES.get(objective, OBJECTIVES["tardiness"]))
 
@@ -221,7 +248,7 @@ def evaluate_donothing(ops, committed, actual_leads, now=0):
         ready = max(comp_end[c["idx"]] for c in ops
                     if c["job"] == o["job"] and c["kind"] == "comp")
         if cstart < now:
-            start = cstart
+            start = max(cstart, ready, clock)
         else:
             start = max(clock, ready, now)
         end = start + o["dur"]
@@ -283,11 +310,18 @@ def generate_options(ops, committed, now, actual_returns,
     for obj in objectives:
         res = build_schedule(ops, now=now, frozen=frozen, actual_leads=actual_returns,
                              objective=obj, reference_plan=committed)
+        # COUNT of scheduled start times that differ from the committed plan --
+        # a schedule-stability (nervousness) proxy across ALL operations
+        # (in-house, outsourced and assembly). NOT a resequencing count: an item
+        # that keeps its queue position but simply runs later still counts. The
+        # magnitude version of this idea is the "stability" objective's summed
+        # absolute deviation; this is the headcount version.
         changed = sum(1 for o in ops
                       if res["plan"][o["idx"]]["start"] != committed[o["idx"]]["start"])
         options.append(dict(objective=obj, label=OBJECTIVE_LABELS[obj],
                             plan=res["plan"], total_tardiness=res["total_tardiness"],
-                            makespan=res["makespan"], ops_changed=changed,
+                            makespan=res["makespan"], start_times_changed=changed,
+                            status=res["status"],
                             asm_order=asm_order(ops, res["plan"])))
     return options
 

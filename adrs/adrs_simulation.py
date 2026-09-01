@@ -254,11 +254,16 @@ def _prep_animation_data(ops, sim_result):
     }
     due_by_job = {o["job"]: o["due"] for o in ops if o["kind"] == "asm"}
     color_by_job = {j: JOB_PALETTE[(j - 1) % len(JOB_PALETTE)] for j in jobs}
+    machine_comp = {}
+    for o in ops:
+        if o["kind"] == "comp" and not o["outsourced"]:
+            machine_comp.setdefault(o["machine"], o["comp"])
     return dict(
         events=sim_result["events"], makespan=sim_result["makespan"],
         machines=machines, asmName=core.ASM_STATION, jobs=jobs,
         compLabels=comp_labels, compsByJob=comps_by_job,
         dueByJob=due_by_job, colorByJob=color_by_job,
+        machineComp=machine_comp,
         minPerDay=core.MIN_PER_DAY,
     )
 
@@ -508,6 +513,13 @@ function draw(ctx, DATA, idx, geo, t){
     ctx.fillText(name === 'OutSrc' ? 'Outsourced' : name, geo.BOX_X0+12, y-boxH/2+18);
     ctx.fillStyle = col; ctx.font='13px ui-monospace, monospace';
     ctx.fillText(rs.boxState, geo.BOX_X0+12, y+boxH/2-14);
+    const compLabel = DATA.machineComp[name];
+    if (compLabel){
+      const opLabel = 'Op' + compLabel.replace(/\D/g, '');   // "C3" -> "Op3"
+      ctx.fillStyle = '#7c8aa3'; ctx.font = '11px ui-monospace, monospace';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      ctx.fillText('Performs ' + opLabel, geo.BOX_X0, y + boxH/2 + 4);
+    }
     const shownCurrent = rs.current.slice(0, MAX_CONCURRENT_SHOWN);
     const curOverflow = Math.max(0, rs.current.length - MAX_CONCURRENT_SHOWN);
     const spacing = shownCurrent.length > 1 ? Math.min(22, (boxH - 40) / (shownCurrent.length - 1)) : 0;
